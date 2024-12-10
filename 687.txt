@@ -1,0 +1,890 @@
+import time
+import aiofiles
+import random
+import asyncio
+import logging
+import os
+from datetime import datetime, timezone
+from telethon.errors import FloodWaitError
+from telethon import TelegramClient, functions, types, errors, events, Button
+from telethon.sessions import StringSession
+from telethon.tl.functions.channels import GetParticipantsRequest
+from telethon.tl.functions.messages import GetCommonChatsRequest
+from telethon.tl.types import (
+    ChannelParticipantsAdmins,
+    ChannelParticipantsSearch,
+    ChannelParticipantsBots
+)
+import json
+from pathlib import Path
+
+class CustomFilter(logging.Filter):
+    def filter(self, record):
+        return not any(msg in record.getMessage() for msg in [
+            "Got difference",
+            "Getting difference",
+            "Sleeping for",
+            "Waiting for",
+            "Session"
+        ])
+
+# Настройка логирования
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+
+# Настройка логгера
+logger = logging.getLogger()  # Используем корневой логгер
+logger.setLevel(logging.INFO)
+
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+# Файловый обработчик
+file_handler = logging.FileHandler('telegram_sender.log')
+file_handler.setFormatter(formatter)
+
+# Консольный обработчик
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(formatter)
+
+logger.addHandler(file_handler)
+logger.addHandler(stream_handler)
+
+API_HASH = "7b14ec69cad5d2d7a7d38463dd6c0271"
+API_ID = 23166055
+
+clients = {}
+running = True
+main_client = None
+reports = []
+
+# Константы для оптимизации
+MESSAGE_BATCH_SIZE = 300  # было 200
+USER_BATCH_SIZE = 100    # было 75
+DELAY_BETWEEN_BATCHES = 0.2  # было 0.3
+MAX_CONCURRENT_TASKS = 15    # было 10
+FLOOD_WAIT_DELAY = 2
+
+async def add_account(phone_number):
+    logger.info(f"Начало процесса добавления аккаунта для номера {phone_number}")
+    client = TelegramClient(f'session_{phone_number}', API_ID, API_HASH)
+    await client.connect()
+    if not await client.is_user_authorized():
+        logger.info(f"Требуется авторизация для номера {phone_number}")
+        await client.send_code_request(phone_number)
+        code = input(f'Введите код для {phone_number}: ')
+        try:
+            await client.sign_in(phone_number, code)
+            logger.info(f"Успешная авторизация для номера {phone_number}")
+        except errors.SessionPasswordNeededError:
+            logger.info(f"Требуется двухфакторная аутентификация для номера {phone_number}")
+            password = input('Введите пароль двухфакторной аутентификации: ')
+            await client.sign_in(password=password)
+    clients[phone_number] = client
+    logger.info(f"Аккаунт {phone_number} успешно добавлен")
+
+async def get_current_user_id(client):
+    me = await client.get_me()
+    return me.id
+
+def input_with_stop(prompt):
+    global running
+    data = input(prompt)
+    if data.strip().lower() == 'stop':
+        running = False
+        logger.info("Получена команда остановки")
+        return None
+    return data
+
+def collect_chat_links():
+    global running
+    chat_links = []
+    data = input_with_stop("Пожалуйста, введите ссылки на чаты, через запятую, в которые должна вестись рассылка: ")
+    if data and running:
+        chat_links = [link.strip() for link in data.split(',')]
+        logger.info(f"Собраны ссылки на чаты: {chat_links}")
+    return chat_links
+
+def get_message_type():
+    while True:
+        print("Выберите тип сообщения для отправки:\n"
+              "1. Фото, видео, аудио, или GIF\n"
+              "2. Текстовое сообщение\n"
+              "3. Мультимедиа + текст")
+        choice = input("Пожалуйста, введите число, соответствующее номеру вашего выбора: ").strip()
+        if choice in ['1', '2', '3']:
+            return int(choice)
+        print("Пожалуйста, введите корректный номер (1, 2 или 3)")
+def get_media_path():
+    while True:
+        path = input("Введите путь к медиафайлу: ").strip()
+        if os.path.exists(path):
+            return path
+        print("Файл не найден. Пожалуйста, проверьте путь и попробуйте снова.")
+
+def collect_message():
+    logger.info("Начало сбора сообщения")
+    message_type = get_message_type()
+    
+    if message_type == 1:
+        return {'type': 'media', 'media_path': get_media_path(), 'text': None}
+    elif message_type == 2:
+        print("Введите текст сообщения. Для завершения ввода напишите 'end' на новой строке:")
+        message = []
+        while True:
+            line = input()
+            if line.strip().lower() == 'end':
+                break
+            message.append(line)
+        return {'type': 'text', 'text': '\n'.join(message), 'media_path': None}
+    else:
+        media_path = get_media_path()
+        print("Введите текст подписи к медиафайлу. Для завершения ввода напишите 'end' на новой строке:")
+        message = []
+        while True:
+            line = input()
+            if line.strip().lower() == 'end':
+                break
+            message.append(line)
+        return {'type': 'media_with_text', 'media_path': media_path, 'text': '\n'.join(message)}
+
+def get_time_interval():
+    global running
+    while running:
+        try:
+            interval = int(input("Введите интервал отправки сообщений в секундах: "))
+            logger.info(f"Установлен интервал отправки: {interval} секунд")
+            return interval
+        except ValueError:
+            logger.warning("Введено некорректное значение интервала")
+            print("Пожалуйста, введите целое число.")
+
+async def get_participants_from_list(client, chat, participants_set=None):
+    global problematic_channels
+
+    logger.info(f"Функция get_participants_from_list вызвана. Начало обработки чата: {chat.title}")
+
+    if participants_set is None:
+        participants_set = set()
+
+    offset = 0
+    limit = 200
+    total_users_processed = 0
+    consecutive_empty_responses = 0
+    retry_count = 0
+    max_retries = 3
+    
+    # Добавляем умную систему пауз
+    base_delay = 0.2
+    flood_wait_multiplier = 1.5
+    last_flood_wait = 0
+    consecutive_successful_requests = 0
+
+    try:
+        while True:
+            logger.info(f"Запрос участников: offset={offset}, limit={limit}, текущий размер множества={len(participants_set)}")
+            try:
+                participants = await client(GetParticipantsRequest(
+                    channel=chat,
+                    filter=ChannelParticipantsSearch(''),
+                    offset=offset,
+                    limit=limit,
+                    hash=0
+                ))
+                users = participants.users
+                logger.info(f"Получено участников: {len(users)}")
+                
+                # Увеличиваем счетчик успешных запросов
+                consecutive_successful_requests += 1
+                # Уменьшаем задержку при стабильной работе
+                if consecutive_successful_requests > 5:
+                    base_delay = max(0.2, base_delay * 0.9)
+                retry_count = 0
+
+            except errors.ChannelPrivateError as e:
+                logger.error(f"Канал {chat.title} стал приватным или доступ запрещён: {e}. Пропускаем.")
+                problematic_channels.add(chat.id)
+                break
+
+            except errors.FloodWaitError as e:
+                consecutive_successful_requests = 0
+                last_flood_wait = e.seconds
+                wait_time = min(e.seconds, 15)
+                
+                # Увеличиваем базовую задержку
+                base_delay *= flood_wait_multiplier
+                logger.warning(f"FloodWaitError: ожидание {wait_time} секунд. Новая базовая задержка: {base_delay}")
+                await asyncio.sleep(wait_time)
+                continue
+
+            except Exception as e:
+                consecutive_successful_requests = 0
+                retry_count += 1
+                if retry_count >= max_retries:
+                    logger.error(f"Достигнуто максимальное количество попыток для чата {chat.title}")
+                    break
+                await asyncio.sleep(base_delay * retry_count)
+                continue
+
+            if not users:
+                consecutive_empty_responses += 1
+                if consecutive_empty_responses > 1:
+                    logger.info("Получено два пустых пакета подряд. Завершаем сбор участников.")
+                    break
+                await asyncio.sleep(base_delay)
+                continue
+
+            consecutive_empty_responses = 0
+            participants_set.update(user.id for user in users)
+
+            total_users_processed += len(users)
+            logger.info(f"Обработано участников: {total_users_processed}. Уникальных: {len(participants_set)}.")
+
+            offset += len(users)
+            
+            # Динамическая задержка с учётом истории запросов
+            current_delay = base_delay
+            if total_users_processed > 5000:
+                current_delay *= 1.2
+            if last_flood_wait > 0:
+                current_delay *= 1.1
+            
+            await asyncio.sleep(current_delay)
+
+    except Exception as e:
+        logger.error(f"Критическая ошибка в get_participants_from_list: {e}")
+
+    logger.info(f"Сбор участников завершён. Итоговое количество уникальных участников: {len(participants_set)}")
+    return participants_set
+
+    async def process_sender_batch(sender_batch):
+        valid_ids = set()
+        tasks = []
+        
+        async def process_small_batch(small_batch):
+            batch_ids = set()
+            try:
+                users = await client.get_entity(small_batch)
+                if not isinstance(users, list):
+                    users = [users]
+                
+                user_tasks = []
+                for user in users:
+                    if isinstance(user, types.User) and not user.bot:
+                        user_tasks.append(check_user_membership(user))
+                if user_tasks:
+                    results = await asyncio.gather(*user_tasks)
+                    batch_ids.update([uid for uid in results if uid])
+            except Exception:
+                pass
+            return batch_ids
+
+        async def check_user_membership(user):
+            try:
+                common_chats = await client(functions.messages.GetCommonChatsRequest(
+                    user_id=user.id,
+                    max_id=0,
+                    limit=100
+                ))
+                if any(chat_id == chat.id for chat in common_chats.chats):
+                    return user.id
+            except Exception:
+                pass
+            return None
+
+        # Увеличиваем размер batch для параллельной обработки
+        for i in range(0, len(sender_batch), 200):
+            small_batch = sender_batch[i:i+200]
+            tasks.append(process_small_batch(small_batch))
+        
+        results = await asyncio.gather(*tasks)
+        for result in results:
+            valid_ids.update(result)
+        
+        return valid_ids
+
+    # Параллельный запуск сбора
+    public_task = asyncio.create_task(collect_public_members())
+    history_task = asyncio.create_task(collect_from_history())
+    
+    public_ids, history_ids = await asyncio.gather(public_task, history_task)
+    
+    all_participant_ids.update(public_ids)
+    all_participant_ids.update(history_ids)
+    
+    print(f"\nИтоговая статистика:")
+    print(f"Обработано сообщений: {processed_messages}")
+    print(f"Собрано уникальных участников: {len(all_participant_ids)}")
+    
+    if all_participant_ids:
+        try:
+            all_participants = []
+            id_list = list(all_participant_ids)
+            
+            # Увеличиваем размер batch для финальной обработки
+            tasks = []
+            for i in range(0, len(id_list), 200):
+                batch = id_list[i:i+200]
+                tasks.append(client.get_entity(batch))
+            
+            results = await asyncio.gather(*tasks)
+            for users in results:
+                if not isinstance(users, list):
+                    users = [users]
+                all_participants.extend(users)
+                if len(all_participants) % 1000 == 0:  # Увеличен интервал логирования
+                    print(f"Получены данные для {len(all_participants)} из {len(all_participant_ids)} участников")
+                
+            return all_participants
+            
+        except Exception as e:
+            print(f"Ошибка при получении данных участников: {e}")
+    
+    return []
+async def verify_participants(client, participants, chat):
+    """Проверка актуальности участников (удаляем только ботов и удалённые аккаунты)"""
+    logger.info(f"Начало проверки участников для чата {chat.title}")
+    logger.info(f"До проверки: всего участников {len(participants)}")
+
+    verified_participants = set()
+    excluded_bots = 0
+    excluded_deleted = 0
+
+    chunks = [list(participants)[i:i + 50] for i in range(0, len(participants), 50)]
+    
+    async def verify_chunk(chunk):
+        nonlocal excluded_bots, excluded_deleted
+        for user_id in chunk:
+            try:
+                user = await client.get_entity(user_id)
+
+                # Убираем ботов и удалённые аккаунты
+                if not user.bot and not user.deleted:
+                    verified_participants.add(user_id)
+                else:
+                    if user.bot:
+                        excluded_bots += 1
+                    if user.deleted:
+                        excluded_deleted += 1
+            except Exception as e:
+                # Если возникла ошибка из-за ограничения на количество запросов
+                if "A wait of" in str(e):
+                    wait_time = 157  # Время, которое нужно подождать, можно сделать динамическим
+                    logger.warning(f"Ожидание {wait_time} секунд перед следующим запросом.")
+                    await asyncio.sleep(wait_time)  # Делаем паузу, чтобы не превышать лимит
+                    continue
+                logger.warning(f"Ошибка при проверке пользователя {user_id}: {e}")
+
+    tasks = []
+    for chunk in chunks:
+        if len(tasks) >= MAX_CONCURRENT_TASKS:
+            logger.info(f"Выполняется {len(tasks)} задач. Ждём завершения.")
+            await asyncio.gather(*tasks)
+            tasks = []
+        tasks.append(verify_chunk(chunk))
+        
+        # Увеличиваем паузу между запросами для снижения частоты ограничений
+        await asyncio.sleep(random.uniform(1, 2))  # Пауза 1-2 секунды между запросами, может быть настроено
+
+    if tasks:
+        await asyncio.gather(*tasks)
+
+    # Логируем количество исключённых ботов и удалённых аккаунтов
+    logger.info(f"После проверки: всего участников {len(verified_participants)}")
+    logger.info(f"Исключено ботов: {excluded_bots}")
+    logger.info(f"Исключено удалённых аккаунтов: {excluded_deleted}")
+    
+    return verified_participants
+
+async def check_user_in_group(client, user_id, chat_id):
+    """
+    Проверяет, состоит ли пользователь в целевой группе (чате).
+    Возвращает True, если пользователь состоит в группе, иначе False.
+    """
+    try:
+        user = await client.get_entity(user_id)
+        common_chats = await client(functions.messages.GetCommonChatsRequest(
+            user_id=user,
+            max_id=0,
+            limit=100
+        ))
+        return any(chat.id == chat_id for chat in common_chats.chats)
+    except Exception:
+        return False
+
+import asyncio
+import aiofiles
+import json
+from datetime import datetime
+from pathlib import Path
+from telethon.errors.rpcerrorlist import FloodWaitError as FloodWait
+
+async def get_participants_from_history(
+    client, 
+    chat, 
+    participants_set=None, 
+    initial_batch_size=600,
+    checkpoint_dir="checkpoints"
+):
+    logger.info(f"Начало сбора участников из истории сообщений для чата: {chat.title}")
+    
+    try:
+        await client.get_messages(chat, limit=1)
+    except Exception as e:
+        logger.error(f"Чат {chat.title} недоступен: {str(e)}")
+        return participants_set
+    
+    if participants_set is None:
+        participants_set = set()
+    
+    checkpoint_path = Path(checkpoint_dir)
+    checkpoint_path.mkdir(exist_ok=True)
+    checkpoint_file = checkpoint_path / f"checkpoint_{chat.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    
+    user_check_cache = {}
+    current_batch_size = 600
+    current_delay = 0.30
+    
+    async def process_user_batch(user_ids):
+        tasks = [check_user_in_group(client, uid, chat.id) for uid in user_ids]
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            return {uid: result for uid, result in zip(user_ids, results) if not isinstance(result, Exception)}
+            
+        except FloodWait as e:
+            logger.warning(f"FloodWait! Ожидание {e.seconds} секунд")
+            await asyncio.sleep(e.seconds)
+            raise e
+
+    async def save_checkpoint(offset, total_messages, participants):
+        checkpoint_data = {
+            "offset": offset,
+            "total_messages": total_messages,
+            "participants": list(participants),
+            "user_cache": {str(k): v for k, v in user_check_cache.items()}
+        }
+        async with aiofiles.open(checkpoint_file, 'w') as f:
+            await f.write(json.dumps(checkpoint_data))
+        logger.info(f"Сохранен чекпоинт после {total_messages} сообщений")
+
+    # Загрузка последнего чекпоинта
+    last_checkpoint = None
+    if checkpoint_path.exists():
+        checkpoints = list(checkpoint_path.glob(f"checkpoint_{chat.id}_*.json"))
+        if checkpoints:
+            latest_checkpoint = max(checkpoints, key=lambda x: x.stat().st_mtime)
+            try:
+                with open(latest_checkpoint) as f:
+                    last_checkpoint = json.load(f)
+                logger.info(f"Загружен последний чекпоинт: {latest_checkpoint}")
+            except Exception as e:
+                logger.error(f"Ошибка загрузки чекпоинта: {e}")
+
+    try:
+        offset = last_checkpoint["offset"] if last_checkpoint else 0
+        total_messages = last_checkpoint["total_messages"] if last_checkpoint else 0
+        if last_checkpoint:
+            participants_set.update(last_checkpoint["participants"])
+            user_check_cache.update({int(k): v for k, v in last_checkpoint["user_cache"].items()})
+        
+        processed_users = len(participants_set)
+        processed_users_for_log = 0
+        start_time = datetime.now()
+        
+        while total_messages < 100000:
+            try:
+                messages = await client.get_messages(chat, limit=600, offset_id=offset)
+                if not messages:
+                    break
+                    
+                total_messages += len(messages)
+                
+                if total_messages % 1000 == 0:
+                    logger.info(
+                        f"Прогресс:\n"
+                        f"- Обработано сообщений: {total_messages}\n"
+                        f"- Текущий размер пакета: {current_batch_size}\n"
+                        f"- Текущая задержка: {current_delay:.2f}с"
+                    )
+                
+                batch_users = {msg.sender_id for msg in messages if msg.sender_id and msg.sender_id not in participants_set}
+                
+                if batch_users:
+                    check_results = await process_user_batch(batch_users)
+                    new_participants = {uid for uid, result in check_results.items() if result}
+                    participants_set.update(new_participants)
+                    new_processed = len(new_participants)
+                    processed_users += new_processed
+                    processed_users_for_log += new_processed
+                    
+                    if processed_users_for_log >= 50:
+                        elapsed_time = (datetime.now() - start_time).total_seconds()
+                        speed = total_messages / elapsed_time
+                        logger.info(
+                            f"Статистика обработки:\n"
+                            f"- Обработано новых участников: +{processed_users_for_log}\n"
+                            f"- Всего участников в базе: {len(participants_set)}\n"
+                            f"- Обработано сообщений: {total_messages}\n"
+                            f"- Скорость: {speed:.0f} сообщений/сек\n"
+                            f"- Размер пакета: {current_batch_size}\n"
+                            f"- Задержка: {current_delay:.2f}с"
+                        )
+                        processed_users_for_log = 0
+                
+                if total_messages % 10000 == 0:
+                    await save_checkpoint(offset, total_messages, participants_set)
+                    
+                offset = messages[-1].id
+                await asyncio.sleep(0.30)
+                
+            except FloodWait as e:
+                logger.warning(f"FloodWait! Ожидание {e.seconds} секунд")
+                await asyncio.sleep(e.seconds)
+                continue
+                    
+            except Exception as e:
+                if "not accessible" in str(e).lower() or "forbidden" in str(e).lower():
+                    logger.error(f"Чат стал недоступен: {str(e)}")
+                    break
+                raise e
+        
+        final_time = (datetime.now() - start_time).total_seconds()
+        logger.info(
+            f"Сбор завершён успешно!\n"
+            f"Итоговая статистика:\n"
+            f"- Всего сообщений: {total_messages}\n"
+            f"- Всего уникальных участников: {len(participants_set)}\n"
+            f"- Время выполнения: {final_time:.1f} сек\n"
+            f"- Средняя скорость: {(total_messages/final_time):.0f} сообщений/сек"
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка при сборе участников: {e}")
+        await save_checkpoint(offset, total_messages, participants_set)
+        raise e
+    
+    return participants_set
+
+async def prepare_chats(client, chat_links):
+    logger.info("Начинаем обработку чатов")
+    chat_details = {}
+    participants_details = {}
+
+    for link in chat_links:
+        try:
+            chat = await client.get_entity(link.strip())
+            chat_title = getattr(chat, 'title', 'Безымянный чат')
+            chat_details[link] = chat_title
+            
+            # Сначала пробуем получить участников из публичного списка
+            participants = await get_participants_from_list(client, chat)
+            logger.info(f"Собрано {len(participants)} участников из публичного списка для чата {chat_title}")
+            
+            # Если участников из публичного списка меньше 100, собираем дополнительно из истории
+            if len(participants) < 100:
+                logger.info(f"Начинаем сбор участников из истории для чата {chat_title}, так как получено менее 100 участников")
+                participants = await get_participants_from_history(client, chat, participants)
+            
+            participants_details[link] = participants
+            logger.info(f"Обработан чат {chat_title}: {len(participants)} участников")
+            await asyncio.sleep(5)  # Пауза между обработкой разных чатов
+
+        except Exception as e:
+            logger.error(f"Ошибка обработки чата {link}: {e}")
+
+    total_participants = sum(len(participants) for participants in participants_details.values())
+    logger.info(f"Обработка чатов завершена. Всего участников: {total_participants}")
+    return chat_details, participants_details
+
+def get_mentions_count():
+    global running
+    while running:
+        try:
+            count = int(input("Сколько участников следует упомянуть в каждом сообщении? Введите число от 1 до 5: "))
+            if 1 <= count <= 5:
+                logger.info(f"Установлено количество упоминаний: {count}")
+                return count
+            else:
+                logger.warning(f"Введено некорректное количество упоминаний: {count}")
+                print("Пожалуйста, введите число от 1 до 5.")
+        except ValueError:
+            logger.warning("Введено некорректное значение для количества упоминаний")
+            print("Пожалуйста, введите целое число.")
+
+def get_stop_condition():
+    while True:
+        choice = input("Остановить рассылку по количеству сообщений или по таймеру? Введите '1', если по количеству сообщений, или '2', если по таймеру: ").strip()
+        if choice == '1':
+            try:
+                count = int(input("Введите общее количество сообщений во все чаты, после которого рассылка должна остановиться: "))
+                logger.info(f"Установлен лимит сообщений: {count}")
+                return {'type': 'count', 'value': count}
+            except ValueError:
+                logger.warning("Введено некорректное значение для лимита сообщений")
+                print("Пожалуйста, введите целое число.")
+        elif choice == '2':
+            try:
+                minutes = int(input("Введите время в минутах, через которое рассылка сообщений должна остановиться: "))
+                logger.info(f"Установлен таймер остановки: {minutes} минут")
+                return {'type': 'timer', 'value': minutes}
+            except ValueError:
+                logger.warning("Введено некорректное значение для таймера")
+                print("Пожалуйста, введите целое число.")
+        else:
+            print("Пожалуйста, введите '1' или '2'")
+
+def ask_mentions():
+    global running
+    while running:
+        try:
+            answer = input("Нужно ли упоминать участников чатов в сообщениях? Введите 'yes', если да, или 'no', если нет: ").strip().lower()
+            if answer == 'yes':
+                logger.info("Упоминания участников включены")
+                return True
+            elif answer == 'no':
+                logger.info("Упоминания участников отключены")
+                return False
+            else:
+                print("Пожалуйста, введите 'yes' или 'no'.")
+        except ValueError:
+            print("Пожалуйста, введите 'yes' или 'no'.")
+
+def ask_mentions_for_all_chats():
+    global running
+    while running:
+        try:
+            answer = input("Нужно ли отмечать участников для всех чатов? Введите 'yes', если да, или 'no', чтобы настроить чаты, для которых упоминания не нужны: ").strip().lower()
+            if answer == 'yes':
+                logger.info("Упоминания включены для всех чатов")
+                return True
+            elif answer == 'no':
+                logger.info("Упоминания будут настроены индивидуально для чатов")
+                return False
+            else:
+                print("Пожалуйста, введите 'yes' или 'no'.")
+        except ValueError:
+            print("Пожалуйста, введите 'yes' или 'no'.")
+
+def get_chats_without_mentions(chat_links):
+    global running
+    while running:
+        try:
+            data = input_with_stop("Пожалуйста, введите ссылки на чаты через запятую, в которых не должны работать упоминания: ")
+            if data:
+                no_mention_chats = [link.strip() for link in data.split(',')]
+                if all(link in chat_links for link in no_mention_chats):
+                    logger.info(f"Установлены чаты без упоминаний: {no_mention_chats}")
+                    return no_mention_chats
+                else:
+                    logger.warning("Указаны некорректные ссылки на чаты")
+                    print("Пожалуйста, введите ссылки только на те чаты, которые указывались ранее.")
+            else:
+                print("Вы должны указать хотя бы одну ссылку.")
+        except Exception as e:
+            logger.error(f"Ошибка при получении списка чатов без упоминаний: {str(e)}")
+            print(f"Произошла ошибка: {e}")
+
+def get_start_time():
+    global running
+    while running:
+        start_time = input("Отложить начало этой рассылки или начать её мгновенно после старта всех рассылок? Если вы хотите отложить начало рассылки, введите дату начала в формате дд.мм.гггг_часы:минуты по UTC. Если хотите начать рассылку сразу после старта, введите 'now': ").strip().lower()
+        if start_time == 'now':
+            logger.info("Установлен мгновенный старт рассылки")
+            return 'now'
+        try:
+            datetime.strptime(start_time, '%d.%m.%Y_%H:%M')
+            logger.info(f"Установлено отложенное время старта: {start_time}")
+            return start_time
+        except ValueError:
+            logger.warning(f"Введен некорректный формат времени: {start_time}")
+            print("Пожалуйста, введите дату в правильном формате или 'now'.")
+
+async def send_message(client, chat, message_data, participants, mentions, campaign_name, mention_cycles, no_mention_chats, chat_link):
+    try:
+        chat_title = getattr(chat, 'title', 'Unnamed Chat')
+        mentions_text = ''
+        
+        if participants and mentions > 0 and chat_link not in no_mention_chats:
+            chat_id = str(chat.id)
+            if chat_id not in mention_cycles:
+                mention_cycles[chat_id] = {
+                    'available_participants': list(participants),
+                    'current_cycle': []
+                }
+            
+            cycle_data = mention_cycles[chat_id]
+            if len(cycle_data['available_participants']) < mentions:
+                cycle_data['available_participants'] = list(participants)
+                cycle_data['current_cycle'] = []
+            
+            selected_users = []
+            for _ in range(mentions):
+                if cycle_data['available_participants']:
+                    user = random.choice(cycle_data['available_participants'])
+                    cycle_data['available_participants'].remove(user)
+                    cycle_data['current_cycle'].append(user)
+                    selected_users.append(user)
+            
+            if selected_users:
+                mentions_text = ''.join([f'<a href="tg://user?id={user}">\u2060</a>' for user in selected_users])
+
+        if message_data['type'] == 'text':
+            final_message = f"{message_data['text']}{mentions_text}"
+            await client.send_message(chat, final_message, parse_mode='html')
+        else:
+            caption = f"{message_data['text']}{mentions_text}" if message_data['text'] else mentions_text
+            await client.send_file(chat, message_data['media_path'], caption=caption, parse_mode='html')
+
+        logger.info(f"{campaign_name}: сообщение отправлено в {chat_title}")
+        return True
+    except Exception as e:
+        logger.error(f"{campaign_name}: ошибка при отправке сообщения в {chat_title}: {str(e)}")
+        return False
+
+async def send_messages(client, chat_links, message_data, chat_details, participants_details, mentions, interval, campaign_name, stop_condition, no_mention_chats):
+    total_messages = 0
+    mention_cycles = {}
+    start_time = time.time()
+    messages_per_interval = len(chat_links)
+    
+    while running:
+        if stop_condition['type'] == 'count' and total_messages >= stop_condition['value']:
+            break
+        elif stop_condition['type'] == 'timer' and (time.time() - start_time) >= stop_condition['value'] * 60:
+            break
+
+        tasks = []
+        for link in chat_links:
+            try:
+                chat = await client.get_entity(link.strip())
+                participants = participants_details.get(link, [])
+                tasks.append(send_message(client, chat, message_data, participants, mentions, campaign_name, mention_cycles, no_mention_chats, link))
+            except Exception as e:
+                logger.error(f"{campaign_name}: ошибка при подготовке отправки в {chat_details.get(link, 'Unnamed Chat')}: {str(e)}")
+        
+        if tasks:
+            results = await asyncio.gather(*tasks)
+            successful_sends = sum(1 for result in results if result)
+            total_messages += successful_sends
+            logger.info(f"{campaign_name}: отправлено {successful_sends} сообщений за последний интервал")
+            logger.info(f"{campaign_name}: всего отправлено сообщений: {total_messages}")
+            
+            if interval > 0:
+                await asyncio.sleep(interval)
+    
+    end_time = time.time()
+    reports.append({
+        "campaign_name": campaign_name,
+        "total_messages": total_messages,
+        "total_duration": end_time - start_time,
+        "start_time": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time)),
+        "end_time": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time)),
+        "chats": [{"link": link, "title": chat_details[link], "messages": total_messages // len(chat_links)} for link in chat_links]
+    })
+
+async def handle_delayed_start(start_time_str):
+    if start_time_str.lower() == 'now':
+        return
+        
+    try:
+        start_time = datetime.strptime(start_time_str, '%d.%m.%Y_%H:%M')
+        start_time = start_time.replace(tzinfo=timezone.utc)
+        current_time = datetime.now(timezone.utc)
+        
+        delay = (start_time - current_time).total_seconds()
+        if delay > 0:
+            logger.info(f"Ожидание до начала рассылки: {delay} секунд")
+            await asyncio.sleep(delay)
+            logger.info("Начинаем рассылку!")
+    except Exception as e:
+        logger.error(f"Ошибка при обработке отложенного старта: {str(e)}")
+
+async def handle_delayed_start_and_send(start_time_str, client, chat_links, message_data, chat_details, participants_details, mentions_count, interval, campaign_name, stop_condition, no_mention_chats):
+    await handle_delayed_start(start_time_str)
+    await send_messages(client, chat_links, message_data, chat_details, participants_details, mentions_count, interval, campaign_name, stop_condition, no_mention_chats)
+async def main():
+    global running, main_client
+    tasks = []
+    start_times = []
+
+    print("Нужно ли вести рассылку с одного аккаунта или с нескольких? Введите '1', если с одного, или '2', если с нескольких.")
+    mode = input().strip()
+    
+    if mode == '1':
+        phone_number = input("Введите номер телефона, с которого зарегистрирован ваш аккаунт в Telegram, с которого должна вестись рассылка: ").strip()
+        await add_account(phone_number)
+        main_client = clients[phone_number]
+
+    for i in range(5):
+        print(f"\nНастройка рассылки {i + 1}/5")
+        campaign_name = input("Пожалуйста, введите название рассылки: ").strip()
+
+        if mode == '2':
+            phone_number = input("Введите номер телефона, с которого зарегистрирован ваш аккаунт в Telegram, с которого должна вестись рассылка: ").strip()
+            if phone_number not in clients:
+                await add_account(phone_number)
+                client = clients[phone_number]
+            else:
+                client = clients[phone_number]
+                logger.info("Вход в данный аккаунт был осуществлён ранее.")
+        else:
+            client = main_client
+        
+        chat_links = collect_chat_links()
+        if not chat_links:
+            logger.warning("Программа остановлена или не указаны ссылки на чаты.")
+            break
+        
+        message_data = collect_message()
+        if not message_data:
+            logger.warning("Программа остановлена или не указан текст сообщения.")
+            break
+
+        logger.info("Начинаем предварительную обработку чатов...")
+        chat_details, participants_details = await prepare_chats(client, chat_links)
+        
+        interval = get_time_interval()
+        mentions = ask_mentions()
+        
+        if mentions:
+            mentions_for_all_chats = ask_mentions_for_all_chats()
+            if mentions_for_all_chats:
+                no_mention_chats = []
+                mentions_count = get_mentions_count()
+            else:
+                no_mention_chats = get_chats_without_mentions(chat_links)
+                mentions_count = get_mentions_count()
+        else:
+            no_mention_chats = chat_links
+            mentions_count = 0
+        
+        stop_condition = get_stop_condition()
+        start_time_str = get_start_time()
+        
+        start_times.append((start_time_str, client, chat_links, message_data, chat_details, 
+                          participants_details, mentions_count, interval, campaign_name, 
+                          stop_condition, no_mention_chats))
+
+        add_more = input("Настройка рассылки успешно завершена. Хотите запустить все добавленные рассылки сейчас или добавить новые? Введите 'start', чтобы начать все рассылки сейчас, или 'add', чтобы добавить новую рассылку: ").strip().lower()
+        if add_more != 'add':
+            break
+
+    if start_times:
+        for params in start_times:
+            task = asyncio.create_task(handle_delayed_start_and_send(*params))
+            tasks.append(task)
+        
+        await asyncio.gather(*tasks)
+
+    for report in reports:
+        logger.info(f"\nОтчет по рассылке: {report['campaign_name']}")
+        logger.info(f"Количество отправленных сообщений: {report['total_messages']}")
+        logger.info(f"Время работы рассылки: {report['total_duration']:.2f} секунд")
+        logger.info("Чаты, в которые осуществлялась рассылка:")
+        for chat in report['chats']:
+            logger.info(f"{chat['link']} | {chat['title']} | {chat['messages']} сообщений")
+
+    for client in clients.values():
+        await client.disconnect()
+
+if __name__ == "__main__":
+    asyncio.run(main())
